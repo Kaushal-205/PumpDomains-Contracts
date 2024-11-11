@@ -16,7 +16,7 @@ contract TLDFactory {
 
 
     // Fee for creating a TLD
-    uint256 public constant TLD_CREATION_FEE = 50 * 1e18; 
+    uint256 public constant TLD_CREATION_FEE = 1 * 1e6; 
 
     // Address to receive the fees (owner of the contract)
     address payable public feeReceiver;
@@ -32,7 +32,9 @@ contract TLDFactory {
     function deployTLD(
         string memory name,
         string memory symbol,
-        string memory tld
+        string memory tld,
+        address tokenAddress,
+        address payable swapBurnContractAddress
     ) 
         external 
         payable 
@@ -46,7 +48,7 @@ contract TLDFactory {
         require(feeSent, "Failed to send TLD creation fee to feeReceiver");
 
         // Create a new PumpDomains contract instance with the predefined public resolver address and feeReceiver
-        PumpDomains newTLD = new PumpDomains(name, symbol, tld, publicResolver, feeReceiver, domainRecordsAddress);
+        PumpDomains newTLD = new PumpDomains(name, symbol, tld, tokenAddress, publicResolver, feeReceiver, domainRecordsAddress, swapBurnContractAddress);
         
         // Store the address of the newly deployed TLD contract
         tldContracts[tld] = address(newTLD);

@@ -4,9 +4,10 @@ pragma solidity ^0.8.0;
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "./Counters.sol"; // Use the custom counter
+import "./Counters.sol";
 import "./IPublicResolver.sol";
 import "./DomainRecords.sol";
+import "./SwapBurnContract.sol";
 
 // import "@openzeppelin/contracts/security/ReentrancyGuard.sol"; // Optional: For reentrancy protection
 
@@ -15,7 +16,7 @@ contract PumpDomains is ERC721URIStorage, Ownable {
 
     // Unique token ID counter for NFTs
     Counters.Counter private _tokenIds;
-
+    
     // Domain structure
     struct Domain {
         address resolver;
@@ -46,6 +47,12 @@ contract PumpDomains is ERC721URIStorage, Ownable {
     // Reference to the public resolver contract
     IPublicResolver public publicResolver;
 
+    // Token swap and burn contrat instance
+    SwapBurnContract swapBurnContract;
+
+    // Pump Token Address
+    address tokenAddress;
+
     // Fee receiver address
     address payable public feeReceiver;
 
@@ -70,16 +77,20 @@ contract PumpDomains is ERC721URIStorage, Ownable {
         string memory _name,
         string memory _symbol,
         string memory _tld,
+        address _tokenAddress,
         address _resolverAddress,
         address payable _feeReceiver,
-        address _domainRecordsAddress
+        address _domainRecordsAddress,
+        address payable _swapBurnContractAddress
     ) ERC721(_name, _symbol) Ownable(msg.sender) {
         tld = _tld;
+        tokenAddress = _tokenAddress;
         publicResolver = IPublicResolver(_resolverAddress); // Use the interface
         feeReceiver = _feeReceiver; // Set the fee receiver
         domainRecords = DomainRecords(_domainRecordsAddress);
+        swapBurnContract = SwapBurnContract(_swapBurnContractAddress);
     }
-
+    
     // Helper function to convert a string to lowercase
     function toLowerCase(
         string memory str
@@ -129,6 +140,13 @@ contract PumpDomains is ERC721URIStorage, Ownable {
             }("");
             require(refundSent, "Failed to refund excess payment");
         }
+
+        uint256 contractShare = (domainPrice * 20) / 100; // 20% stays in contract
+        uint256 swapAmount = domainPrice - contractShare; // 80% for swap and burn
+
+        // Call the swap and burn function
+        swapBurnContract.swapAndBurn{value: swapAmount}(tokenAddress);
+
 
         // Mint NFT for the new domain
         _tokenIds.increment();
@@ -305,7 +323,7 @@ contract PumpDomains is ERC721URIStorage, Ownable {
     function generateDomainHash(
         string memory name
     ) public view returns (bytes32) {
-        return keccak256(abi.encodePacked(toLowerCase(name), ".", tld)); 
+        return keccak256(abi.encodePacked(toLowerCase(name), ".", tld));
     }
 
     // Burn a domain's token (for use cases like expiring domains)
@@ -333,7 +351,7 @@ contract PumpDomains is ERC721URIStorage, Ownable {
 
     // Set primary domain for the user
     function setPrimaryDomain(string memory name) external {
-        bytes32 domainHash = generateDomainHash(toLowerCase(name)); 
+        bytes32 domainHash = generateDomainHash(toLowerCase(name));
         require(domainToTokenId[domainHash] != 0, "Domain does not exist"); // Check if the domain is registered
         require(
             ownerOf(domainToTokenId[domainHash]) == msg.sender,
