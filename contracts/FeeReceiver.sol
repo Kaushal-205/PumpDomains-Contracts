@@ -19,7 +19,10 @@ contract FeeReceiver is Ownable, ReentrancyGuard {
      * @param initialOwner The address of the initial owner.
      */
     constructor(address initialOwner) Ownable(initialOwner) ReentrancyGuard() {
-        require(initialOwner != address(0), "Initial owner cannot be zero address");
+        require(
+            initialOwner != address(0),
+            "Initial owner cannot be zero address"
+        );
     }
 
     /**
@@ -41,9 +44,15 @@ contract FeeReceiver is Ownable, ReentrancyGuard {
      * @param to The address to receive the withdrawn funds.
      * @param amount The amount of funds to withdraw (in wei).
      */
-    function withdraw(address payable to, uint256 amount) external onlyOwner nonReentrant {
+    function withdraw(
+        address payable to,
+        uint256 amount
+    ) external onlyOwner nonReentrant {
         require(to != address(0), "Invalid recipient address");
-        require(address(this).balance >= amount, "Insufficient funds in contract");
+        require(
+            address(this).balance >= amount,
+            "Insufficient funds in contract"
+        );
 
         // Transfer the specified amount to the recipient
         (bool success, ) = to.call{value: amount}("");

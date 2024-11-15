@@ -1,78 +1,58 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "./Counters.sol";
 import "./IPublicResolver.sol";
 import "./DomainRecords.sol";
 import "./SwapBurnContract.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-// import "@openzeppelin/contracts/security/ReentrancyGuard.sol"; // Optional: For reentrancy protection
-
-contract PumpDomains is ERC721URIStorage, Ownable {
+contract PumpDomains is ERC721URIStorage, Ownable, ReentrancyGuard {
     using Counters for Counters.Counter;
 
-    // Unique token ID counter for NFTs
-    Counters.Counter private _tokenIds;
-    
-    // Domain structure
-    struct Domain {
-        address resolver;
-        uint256 expires;
-        string name; // Store the original domain name
-    }
-
-    // Mapping from domain name hash to domain details
-    mapping(bytes32 => Domain) public domains;
-
-    // Mapping from domain name hash to tokenId (ERC721 token)
-    mapping(bytes32 => uint256) public domainToTokenId;
-
-    // Reverse mapping: tokenId to domain hash
-    mapping(uint256 => bytes32) public tokenIdToDomainHash;
-
-    // TLD for the contract (e.g., .trx)
-    string public tld;
-
-    // Domain expiration period (in seconds)
-    uint256 public domainExpirationPeriod = 365 days;
-
-    // Pricing for different domain lengths (in TRX)
-    uint256 public price3Letters = 10 * 1e18; // 10 TRX
-    uint256 public price4Letters = 5 * 1e18; // 5 TRX
-    uint256 public price5PlusLetters = 3 * 1e18; // 3 TRX
-
-    // Reference to the public resolver contract
-    IPublicResolver public publicResolver;
-
-    // Token swap and burn contrat instance
-    SwapBurnContract swapBurnContract;
-
-    // Pump Token Address
-    address tokenAddress;
-
-    // Fee receiver address
-    address payable public feeReceiver;
-
-    DomainRecords public domainRecords;
-
-    // Events for domain activities
     event DomainRegistered(
         bytes32 indexed domain,
         address indexed owner,
         uint256 tokenId,
         uint256 expires
     );
-    event ResolverSet(bytes32 indexed domain, address indexed resolver);
     event DomainRenewed(
         bytes32 indexed domain,
         address indexed owner,
         uint256 newExpires
     );
+    event ResolverSet(bytes32 indexed domain, address indexed resolver);
 
-    // Constructor to set the name, symbol, TLD, resolver address, and fee receiver
+    struct Domain {
+        address resolver;
+        uint256 expires;
+        string name;
+    }
+
+    struct PriceConfig {
+        uint256 length;
+        uint256 price;
+    }
+
+    // Storage
+    string public tld;
+    uint256 public constant EXPIRATION_PERIOD = 365 days;
+    Counters.Counter private _tokenIds;
+    address public immutable tokenAddress;
+    address payable public immutable feeReceiver;
+
+    mapping(bytes32 => Domain) public domains;
+    mapping(bytes32 => uint256) public domainToTokenId;
+    mapping(uint256 => bytes32) public tokenIdToDomainHash;
+
+    PriceConfig[] public priceConfigs;
+
+    IPublicResolver public immutable publicResolver;
+    DomainRecords public immutable domainRecords;
+    SwapBurnContract public immutable swapBurnContract;
+
     constructor(
         string memory _name,
         string memory _symbol,
@@ -81,85 +61,58 @@ contract PumpDomains is ERC721URIStorage, Ownable {
         address _resolverAddress,
         address payable _feeReceiver,
         address _domainRecordsAddress,
-        address payable _swapBurnContractAddress
+        address payable _swapBurnContract
     ) ERC721(_name, _symbol) Ownable(msg.sender) {
         tld = _tld;
         tokenAddress = _tokenAddress;
-        publicResolver = IPublicResolver(_resolverAddress); // Use the interface
-        feeReceiver = _feeReceiver; // Set the fee receiver
+        publicResolver = IPublicResolver(_resolverAddress);
+        feeReceiver = _feeReceiver;
         domainRecords = DomainRecords(_domainRecordsAddress);
-        swapBurnContract = SwapBurnContract(_swapBurnContractAddress);
-    }
-    
-    // Helper function to convert a string to lowercase
-    function toLowerCase(
-        string memory str
-    ) internal pure returns (string memory) {
-        bytes memory bStr = bytes(str);
-        bytes memory bLower = new bytes(bStr.length);
-        for (uint256 i = 0; i < bStr.length; i++) {
-            if ((uint8(bStr[i]) >= 65) && (uint8(bStr[i]) <= 90)) {
-                bLower[i] = bytes1(uint8(bStr[i]) + 32);
-            } else {
-                bLower[i] = bStr[i];
-            }
-        }
-        return string(bLower);
+        swapBurnContract = SwapBurnContract(_swapBurnContract);
+
+        priceConfigs.push(PriceConfig(3, 10 * 1e6));
+        priceConfigs.push(PriceConfig(4, 5 * 1e6));
+        priceConfigs.push(PriceConfig(5, 3 * 1e6));
     }
 
-    // Modifier to ensure the caller is the NFT owner of a domain
-    modifier onlyDomainOwner(bytes32 domainHash) {
-        require(
-            ownerOf(domainToTokenId[domainHash]) == msg.sender,
-            "Not the domain owner"
-        );
-        _;
-    }
-
-    // Register a domain, mint the ERC721 token, set ownership, expiration, and resolver
-    function registerDomain(string memory name) external payable {
-        name = toLowerCase(name); // Convert to lowercase
-        bytes32 domainHash = generateDomainHash(name);
+     // Register a domain, mint the ERC721 token, set ownership, expiration, and resolver
+    function registerDomain(string memory name) external payable nonReentrant {
+        bytes32 domainHash = _generateDomainHash(name);
         require(domainToTokenId[domainHash] == 0, "Domain already registered");
 
-        // Calculate price based on domain length
         uint256 domainPrice = getDomainPrice(name);
-        require(
-            msg.value >= domainPrice,
-            "Insufficient TRX sent for domain registration"
-        );
+        require(msg.value >= domainPrice, "Insufficient payment");
 
-        // Forward the domainPrice to the feeReceiver
-        (bool sent, ) = feeReceiver.call{value: domainPrice}("");
-        require(sent, "Failed to send fee to feeReceiver");
+        // First calculate the shares
+        uint256 contractShare = (domainPrice * 20) / 100; // 20% for feeReceiver
+        uint256 swapAmount = (domainPrice * 80) / 100;    // 80% for swap and burn
 
-        // Refund excess payment if any
-        if (msg.value > domainPrice) {
-            (bool refundSent, ) = msg.sender.call{
-                value: msg.value - domainPrice
-            }("");
-            require(refundSent, "Failed to refund excess payment");
-        }
-
-        uint256 contractShare = (domainPrice * 20) / 100; // 20% stays in contract
-        uint256 swapAmount = domainPrice - contractShare; // 80% for swap and burn
-
-        // Call the swap and burn function
+        // 1. First send the 20% to feeReceiver
+        (bool feeReceiverSent, ) = feeReceiver.call{value: contractShare}("");
+        require(feeReceiverSent, "Fee transfer failed");
+        
+        // 2. Send 80% to swap and burn contract
         swapBurnContract.swapAndBurn{value: swapAmount}(tokenAddress);
 
+        // 3. Calculate and refund excess payment if any
+        uint256 excessAmount = msg.value - domainPrice;
+        if (excessAmount > 0) {
+            (bool refundSent, ) = payable(msg.sender).call{value: excessAmount}("");
+            
+            require(refundSent, "Refund transfer failed");
+        }
 
-        // Mint NFT for the new domain
         _tokenIds.increment();
         uint256 newTokenId = _tokenIds.current();
 
-        // Mint the NFT and transfer ownership to the caller
+        // Register domain
         _safeMint(msg.sender, newTokenId);
         domainToTokenId[domainHash] = newTokenId;
         tokenIdToDomainHash[newTokenId] = domainHash;
 
-        // Set domain information with an expiration date
         uint256 registrationDate = block.timestamp;
-        uint256 expirationDate = registrationDate + domainExpirationPeriod;
+        uint256 expirationDate = registrationDate + EXPIRATION_PERIOD;
+
         domains[domainHash] = Domain({
             resolver: msg.sender,
             expires: expirationDate,
@@ -188,90 +141,72 @@ contract PumpDomains is ERC721URIStorage, Ownable {
         emit ResolverSet(domainHash, msg.sender);
     }
 
-    // Function to get the price of a domain based on its length
-    function getDomainPrice(string memory name) public view returns (uint256) {
-        uint256 length = bytes(name).length;
-
-        if (length == 3) {
-            return price3Letters;
-        } else if (length == 4) {
-            return price4Letters;
-        } else if (length >= 5) {
-            return price5PlusLetters;
-        } else {
-            revert("Domain name is too short");
-        }
-    }
-
-    function checkOwnership(
-        string memory domainName
-    ) external view returns (bool) {
-        bytes32 domainHash = generateDomainHash(toLowerCase(domainName));
-        uint256 tokenId = domainToTokenId[domainHash];
-        return ownerOf(tokenId) == msg.sender;
-    }
-
     // Renew an existing domain by extending its expiration
-    function renewDomain(
-        string memory name
-    ) external payable onlyDomainOwner(generateDomainHash(toLowerCase(name))) {
-        name = toLowerCase(name); // Convert to lowercase
-        bytes32 domainHash = generateDomainHash(name);
+    function renewDomain(string memory name) external payable nonReentrant {
+        bytes32 domainHash = _generateDomainHash(name);
+        require(ownerOf(domainToTokenId[domainHash]) == msg.sender, "Not domain owner");
 
-        // Calculate renewal price based on domain length
         uint256 renewalPrice = getDomainPrice(name);
-        require(
-            msg.value >= renewalPrice,
-            "Insufficient TRX sent for domain renewal"
-        );
+        require(msg.value >= renewalPrice, "Insufficient payment");
 
-        // Forward the renewalPrice to the feeReceiver
         (bool sent, ) = feeReceiver.call{value: renewalPrice}("");
-        require(sent, "Failed to send fee to feeReceiver");
+        require(sent, "Transfer failed");
 
-        // Refund excess payment if any
         if (msg.value > renewalPrice) {
-            (bool refundSent, ) = msg.sender.call{
-                value: msg.value - renewalPrice
-            }("");
-            require(refundSent, "Failed to refund excess payment");
+            (bool refundSent, ) = msg.sender.call{value: msg.value - renewalPrice}("");
+            require(refundSent, "Refund transfer failed");
         }
 
-        // Extend the domain's expiration date
-        domains[domainHash].expires += domainExpirationPeriod;
-
+        domains[domainHash].expires += EXPIRATION_PERIOD;
         emit DomainRenewed(domainHash, msg.sender, domains[domainHash].expires);
     }
 
-    // Set or change the resolver for a domain
-    function setResolver(
-        string memory name,
-        address resolver
-    ) external onlyDomainOwner(generateDomainHash(toLowerCase(name))) {
-        name = toLowerCase(name); // Convert to lowercase
-        bytes32 domainHash = generateDomainHash(name);
-        domains[domainHash].resolver = resolver;
-        emit ResolverSet(domainHash, resolver); // Emit event for the new resolver
+
+    function setPrimaryDomain(string calldata name) external {
+        bytes32 domainHash = _generateDomainHash(name);
+        require(domainToTokenId[domainHash] != 0, "Domain not found");
+        require(ownerOf(domainToTokenId[domainHash]) == msg.sender, "Not domain owner");
+        publicResolver.setPrimaryDomain(msg.sender, domainHash);
     }
 
-    // Create a subdomain, mint an NFT for it, and assign the owner
+    function setResolver(string calldata name, address resolver) external {
+        bytes32 domainHash = _generateDomainHash(name);
+        require(ownerOf(domainToTokenId[domainHash]) == msg.sender, "Not domain owner");
+        domains[domainHash].resolver = resolver;
+        emit ResolverSet(domainHash, resolver);
+    }
+    
     function createSubDomain(
-        string memory parentName,
-        string memory subName,
+        string calldata parentName,
+        string calldata subName,
         address owner
-    ) external onlyDomainOwner(generateDomainHash(toLowerCase(parentName))) {
-        parentName = toLowerCase(parentName); // Convert to lowercase
-        subName = toLowerCase(subName); // Convert to lowercase
-        bytes32 parentHash = generateDomainHash(parentName);
+    ) external {
+        bytes32 parentHash = _generateDomainHash(parentName);
+        require(ownerOf(domainToTokenId[parentHash]) == msg.sender, "Not domain owner");
+
         bytes32 subDomainHash = keccak256(
             abi.encodePacked(parentHash, subName)
         );
+        require(domainToTokenId[subDomainHash] == 0, "Domain already registered");
 
-        require(
-            domainToTokenId[subDomainHash] == 0,
-            "Subdomain already exists"
-        );
+        _mintSubdomain(subName, subDomainHash, owner);
+    }
 
+    function setPriceConfig(uint256 length, uint256 price) external onlyOwner {
+        for (uint256 i = 0; i < priceConfigs.length; i++) {
+            if (priceConfigs[i].length == length) {
+                priceConfigs[i].price = price;
+                return;
+            }
+        }
+        priceConfigs.push(PriceConfig(length, price));
+    }
+
+    function _mintSubdomain(
+        string memory subName,
+        bytes32 subDomainHash,
+        address owner
+    ) internal {
         _tokenIds.increment();
         uint256 newSubTokenId = _tokenIds.current();
 
@@ -281,11 +216,10 @@ contract PumpDomains is ERC721URIStorage, Ownable {
 
         domains[subDomainHash] = Domain(
             owner,
-            block.timestamp + domainExpirationPeriod,
+            block.timestamp + EXPIRATION_PERIOD,
             subName
         );
 
-        // Link the subdomain to the user's address in the public resolver
         publicResolver.linkDomainToAddress(subDomainHash, owner);
 
         emit DomainRegistered(
@@ -296,48 +230,74 @@ contract PumpDomains is ERC721URIStorage, Ownable {
         );
     }
 
-    // Get the resolver for a domain
-    function getResolver(string memory name) external view returns (address) {
-        bytes32 domainHash = generateDomainHash(toLowerCase(name)); // Convert to lowercase
-        return domains[domainHash].resolver;
+    // View functions
+    function getDomainPrice(string memory name) public view returns (uint256) {
+        uint256 length = bytes(name).length;
+        require(length >= 3, "Domain name too short");
+
+        for (uint256 i = 0; i < priceConfigs.length; i++) {
+            if (priceConfigs[i].length == length) {
+                return priceConfigs[i].price;
+            }
+            // If we're at the last config and the length is greater, use that price
+            if (i == priceConfigs.length - 1 && length > priceConfigs[i].length) {
+                return priceConfigs[i].price;
+            }
+        }
+        
+        revert("Invalid domain length");
     }
 
-    // Get the expiration date of a domain
-    function getExpiration(string memory name) external view returns (uint256) {
-        bytes32 domainHash = generateDomainHash(toLowerCase(name)); // Convert to lowercase
-        return domains[domainHash].expires;
+    function _generateDomainHash(
+        string memory name
+    ) internal view returns (bytes32) {
+        return keccak256(abi.encodePacked(_toLowerCase(name), ".", tld));
     }
 
-    // Get the full domain name (name + TLD) from the hash
+    function _toLowerCase(
+        string memory str
+    ) internal pure returns (string memory) {
+        bytes memory bStr = bytes(str);
+        bytes memory bLower = new bytes(bStr.length);
+        for (uint256 i = 0; i < bStr.length; i++) {
+            bLower[i] = bytes1(
+                uint8(bStr[i]) >= 65 && uint8(bStr[i]) <= 90
+                    ? uint8(bStr[i]) + 32
+                    : uint8(bStr[i])
+            );
+        }
+        return string(bLower);
+    }
+
+    function checkOwnership(
+        string calldata domainName
+    ) external view returns (bool) {
+        bytes32 domainHash = _generateDomainHash(domainName);
+        uint256 tokenId = domainToTokenId[domainHash];
+        return ownerOf(tokenId) == msg.sender;
+    }
+
     function getDomainName(
         bytes32 domainHash
     ) external view returns (string memory) {
         require(
             domains[domainHash].expires > block.timestamp,
-            "Domain does not exist or has expired"
+            "Domain expired"
         );
         return string(abi.encodePacked(domains[domainHash].name, ".", tld));
     }
 
-    // Generate a unique domain hash based on the name and TLD
-    function generateDomainHash(
-        string memory name
-    ) public view returns (bytes32) {
-        return keccak256(abi.encodePacked(toLowerCase(name), ".", tld));
-    }
-
-    // Burn a domain's token (for use cases like expiring domains)
-    function burnDomain(string memory name) external onlyOwner {
-        bytes32 domainHash = generateDomainHash(toLowerCase(name));
+    // Admin functions
+    function burnDomain(string calldata name) external onlyOwner {
+        bytes32 domainHash = _generateDomainHash(name);
         uint256 tokenId = domainToTokenId[domainHash];
-        require(tokenId != 0, "Domain does not exist");
+        require(tokenId != 0, "Domain not exists");
 
         _burn(tokenId);
         delete domainToTokenId[domainHash];
         delete tokenIdToDomainHash[tokenId];
         delete domains[domainHash];
     }
-
     // Set the token URI for an NFT
     function setTokenURI(uint256 tokenId, string memory _tokenURI) external {
         require(
@@ -347,16 +307,5 @@ contract PumpDomains is ERC721URIStorage, Ownable {
             "Not approved or owner"
         );
         _setTokenURI(tokenId, _tokenURI);
-    }
-
-    // Set primary domain for the user
-    function setPrimaryDomain(string memory name) external {
-        bytes32 domainHash = generateDomainHash(toLowerCase(name));
-        require(domainToTokenId[domainHash] != 0, "Domain does not exist"); // Check if the domain is registered
-        require(
-            ownerOf(domainToTokenId[domainHash]) == msg.sender,
-            "Not the domain owner"
-        ); // Check ownership
-        publicResolver.setPrimaryDomain(msg.sender, domainHash); // Call to set primary domain using the interface
     }
 }

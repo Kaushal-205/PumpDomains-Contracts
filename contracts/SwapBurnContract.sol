@@ -1,20 +1,18 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-import "@uniswap/v3-periphery/contracts/interfaces/ISwapRouter.sol";
+import "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
+import "@uniswap/v2-core/contracts/interfaces/IUniswapV2Factory.sol";
+import "@uniswap/v2-core/contracts/interfaces/IUniswapV2Pair.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@uniswap/v3-periphery/contracts/interfaces/ISwapRouter.sol";
-
-// Interface for wrapped TRX
-interface IWTRX is IERC20 {
-    function deposit() external payable;
-    function withdraw(uint256) external;
-}
 
 contract SwapBurnContract is Ownable {
-    ISwapRouter public immutable swapRouter;
-    IWTRX public immutable WTRX = IWTRX(0xfb3b3134F13CcD2C81F4012E53024e8135d58FeE);
+    IUniswapV2Router02 public immutable swapRouter;
+    IUniswapV2Factory public immutable factory;
+    address public immutable WTRX;
+    
+    uint256 public constant MINIMUM_LIQUIDITY = 1000; // Adjust this threshold as needed
 
     event TokenSwapped(
         address indexed tokenOut,
@@ -22,72 +20,71 @@ contract SwapBurnContract is Ownable {
         uint256 tokensReceived
     );
     event TokensBurned(address indexed token, uint256 amount);
-    
-    constructor(address _swapRouter) Ownable(msg.sender) {
-        swapRouter = ISwapRouter(_swapRouter);
-        // WTRX = IWTRX(_wtrx);
+
+    constructor(
+        address _swapRouter,
+        address _factory
+    ) Ownable(msg.sender) {
+        swapRouter = IUniswapV2Router02(_swapRouter);
+        factory = IUniswapV2Factory(_factory);
+        WTRX = IUniswapV2Router02(_swapRouter).WETH();
     }
-    
+
+    function checkPairLiquidity(
+        address tokenOut
+    ) public view returns (bool exists) {
+        address pairAddress = factory.getPair(WTRX, tokenOut);
+        if (pairAddress == address(0)) {
+            return false;
+        }
+
+        IUniswapV2Pair pair = IUniswapV2Pair(pairAddress);
+        (uint112 reserve0, uint112 reserve1,) = pair.getReserves();
+        
+        // Check if both reserves have sufficient liquidity
+        bool hasLiquidity = (reserve0 >= MINIMUM_LIQUIDITY && reserve1 >= MINIMUM_LIQUIDITY);
+        
+        return hasLiquidity;
+    }
+
     function swapAndBurn(address tokenAddress) external payable {
         require(msg.value > 0, "Must send TRX");
-        
-        // First wrap TRX to WTRX
-        WTRX.deposit{value: msg.value}();
-        
-        // Approve the router to spend WTRX
-        WTRX.approve(address(swapRouter), msg.value);
-        
-        // Perform the swap
-        uint256 tokensReceived = _swapExactTRXForTokens(
-            tokenAddress,
-            msg.value
+    
+        // Get the pair address for WTRX and tokenAddress
+        address pairAddress = factory.getPair(WTRX, tokenAddress);
+        require(pairAddress != address(0), "No pair exists");
+    
+        // Create the path array correctly
+        address[] memory path = new address[](2);
+        path[0] = WTRX;
+        path[1] = tokenAddress; 
+    
+        // Perform the swap directly with TRX
+        uint256[] memory amounts = swapRouter.swapExactETHForTokens{value: msg.value}(
+            0,                   // Accept any amount of tokens (for simplicity)
+            path,              // The path array
+            address(this),       // Recipient of tokens
+            block.timestamp + 15 minutes // Deadline
         );
-        
+    
+        uint256 tokensReceived = amounts[1];
+        emit TokenSwapped(tokenAddress, msg.value, tokensReceived);
+    
         // Burn the received tokens
-        _burnTokens(tokenAddress, tokensReceived);
+        address DEAD_ADDRESS = address(1);
+        IERC20(tokenAddress).transfer(DEAD_ADDRESS, tokensReceived);
+        emit TokensBurned(tokenAddress, tokensReceived);
     }
-    
-    function _swapExactTRXForTokens(
-        address tokenOut,
-        uint256 amountIn
-    ) internal returns (uint256 amountOut) {
-        // Wrap parameters for the swap
-        ISwapRouter.ExactInputSingleParams memory params = ISwapRouter
-            .ExactInputSingleParams({
-                tokenIn: address(WTRX),  // Use WTRX address instead of address(0)
-                tokenOut: tokenOut,
-                fee: 3000,
-                recipient: address(this),
-                deadline: block.timestamp + 15 minutes,
-                amountIn: amountIn,
-                amountOutMinimum: 0, // Be careful with this in production!
-                sqrtPriceLimitX96: 0
-            });
 
-        // Execute the swap
-        amountOut = swapRouter.exactInputSingle(params);  // Remove the value parameter
-        
-        emit TokenSwapped(tokenOut, amountIn, amountOut);
-        return amountOut;
-    }
-    
-    function _burnTokens(address token, uint256 amount) internal {
-        // Some tokens have a burn function, but for those that don't,
-        // we'll send to a dead address
-        address DEAD_ADDRESS = address(0x0000000000000000000000000000000000000000);
-        
-        IERC20(token).transfer(DEAD_ADDRESS, amount);
-        
-        emit TokensBurned(token, amount);
-    }
-    
     function rescueTokens(address token, uint256 amount) external onlyOwner {
         IERC20(token).transfer(owner(), amount);
     }
-    
+
     function rescueTRX() external onlyOwner {
         payable(owner()).transfer(address(this).balance);
     }
-    
+
     receive() external payable {}
+    fallback() external payable {}
+
 }
